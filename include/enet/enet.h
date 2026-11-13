@@ -230,7 +230,11 @@ enum
    ENET_PEER_FREE_UNSEQUENCED_WINDOWS     = 32,
    ENET_PEER_RELIABLE_WINDOWS             = 16,
    ENET_PEER_RELIABLE_WINDOW_SIZE         = 0x1000,
-   ENET_PEER_FREE_RELIABLE_WINDOWS        = 8
+   ENET_PEER_FREE_RELIABLE_WINDOWS        = 8,
+   ENET_PEER_MIGRATE_RETRY_INTERVAL       = 250,
+   ENET_PEER_MIGRATE_CHALLENGE_INTERVAL   = 250,
+   ENET_PEER_MIGRATE_CHALLENGE_TIMEOUT    = 5000,
+   ENET_PEER_MIGRATE_TIMEOUT              = 10000
 };
 
 typedef struct _ENetChannel
@@ -250,6 +254,16 @@ typedef enum _ENetPeerFlag
    ENET_PEER_FLAG_NEEDS_DISPATCH   = (1 << 0),
    ENET_PEER_FLAG_CONTINUE_SENDING = (1 << 1)
 } ENetPeerFlag;
+
+/** Connection migration states of a peer, see the migrateState field of ENetPeer. */
+typedef enum _ENetPeerMigrateState
+{
+   /** no migration in progress */
+   ENET_PEER_MIGRATE_STATE_NONE       = 0,
+   /** we requested migrating this connection to a new local address and are
+     * retransmitting MIGRATE until the peer acknowledges the new path */
+   ENET_PEER_MIGRATE_STATE_REQUESTING = 1
+} ENetPeerMigrateState;
 
 /**
  * An ENet peer which data packets may be sent or received from. 
@@ -318,6 +332,14 @@ typedef struct _ENetPeer
    enet_uint32   unsequencedWindow [ENET_PEER_UNSEQUENCED_WINDOW_SIZE / 32]; 
    enet_uint32   eventData;
    size_t        totalWaitingData;
+   enet_uint32   incomingMigrateCredential [2]; /**< credential the remote peer must present to migrate this connection to a new address (0 if migration was not negotiated) */
+   enet_uint32   outgoingMigrateCredential [2]; /**< credential this peer presents to the remote peer when migrating to a new address (0 if migration was not negotiated) */
+   ENetAddress   migrateAddress;       /**< candidate new peer address with a path challenge in flight */
+   enet_uint32   migrateToken [2];     /**< token of the outstanding path challenge */
+   enet_uint32   migrateChallengeTime; /**< time the last path challenge was sent; 0 if no challenge is pending */
+   enet_uint32   migrateRequestTime;   /**< time the last MIGRATE request was sent */
+   enet_uint32   migrateStateTime;     /**< time the current migration attempt was started */
+   enet_uint8    migrateState;         /**< one of the ENET_PEER_MIGRATE_STATE_* constants */
 } ENetPeer;
 
 /** An ENet packet compressor for compressing UDP packets before socket sends or receives.
@@ -394,6 +416,7 @@ typedef struct _ENetHost
    size_t               duplicatePeers;              /**< optional number of allowed peers from duplicate IPs, defaults to ENET_PROTOCOL_MAXIMUM_PEER_ID */
    size_t               maximumPacketSize;           /**< the maximum allowable packet size that may be sent or received on a peer */
    size_t               maximumWaitingData;          /**< the maximum aggregate amount of buffer space a peer may use waiting for packets to be delivered */
+   enet_uint32          enableMigration;             /**< whether connection migration is enabled for this host; defaults to 0 (disabled), see enet_host_enable_migration() */
 } ENetHost;
 
 /**
@@ -574,6 +597,7 @@ ENET_API void       enet_host_compress (ENetHost *, const ENetCompressor *);
 ENET_API int        enet_host_compress_with_range_coder (ENetHost * host);
 ENET_API void       enet_host_channel_limit (ENetHost *, size_t);
 ENET_API void       enet_host_bandwidth_limit (ENetHost *, enet_uint32, enet_uint32);
+ENET_API void       enet_host_enable_migration (ENetHost *, enet_uint32);
 extern   void       enet_host_bandwidth_throttle (ENetHost *);
 extern  enet_uint32 enet_host_random_seed (void);
 extern  enet_uint32 enet_host_random (ENetHost *);
@@ -588,6 +612,7 @@ ENET_API void                enet_peer_disconnect (ENetPeer *, enet_uint32);
 ENET_API void                enet_peer_disconnect_now (ENetPeer *, enet_uint32);
 ENET_API void                enet_peer_disconnect_later (ENetPeer *, enet_uint32);
 ENET_API void                enet_peer_throttle_configure (ENetPeer *, enet_uint32, enet_uint32, enet_uint32);
+ENET_API int                 enet_peer_migrate (ENetPeer *);
 extern int                   enet_peer_throttle (ENetPeer *, enet_uint32);
 extern void                  enet_peer_reset_queues (ENetPeer *);
 extern int                   enet_peer_has_outgoing_commands (ENetPeer *);

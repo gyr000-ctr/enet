@@ -108,6 +108,11 @@ if (WIN32)
     target_link_libraries(enet winmm ws2_32)
 endif()
 
+enable_testing()
+add_executable(enet_migration_test tests/migration.c)
+target_link_libraries(enet_migration_test enet)
+add_test(NAME enet_migration_test COMMAND enet_migration_test)
+
 include(GNUInstallDirs)
 install(TARGETS enet
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

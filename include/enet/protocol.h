@@ -35,7 +35,10 @@ typedef enum _ENetProtocolCommand
    ENET_PROTOCOL_COMMAND_BANDWIDTH_LIMIT    = 10,
    ENET_PROTOCOL_COMMAND_THROTTLE_CONFIGURE = 11,
    ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT = 12,
-   ENET_PROTOCOL_COMMAND_COUNT              = 13,
+   ENET_PROTOCOL_COMMAND_MIGRATE            = 13,
+   ENET_PROTOCOL_COMMAND_MIGRATE_CHALLENGE  = 14,
+   ENET_PROTOCOL_COMMAND_MIGRATE_RESPONSE   = 15,
+   ENET_PROTOCOL_COMMAND_COUNT              = 16,
 
    ENET_PROTOCOL_COMMAND_MASK               = 0x0F
 } ENetProtocolCommand;
@@ -44,6 +47,9 @@ typedef enum _ENetProtocolFlag
 {
    ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE = (1 << 7),
    ENET_PROTOCOL_COMMAND_FLAG_UNSEQUENCED = (1 << 6),
+   /** set on CONNECT/VERIFY_CONNECT commands that carry a migration
+     * credential extension (8 extra bytes after the base command) */
+   ENET_PROTOCOL_COMMAND_FLAG_MIGRATION   = (1 << 5),
 
    ENET_PROTOCOL_HEADER_FLAG_COMPRESSED = (1 << 14),
    ENET_PROTOCOL_HEADER_FLAG_SENT_TIME  = (1 << 15),
@@ -174,6 +180,48 @@ typedef struct _ENetProtocolSendFragment
    enet_uint32 fragmentOffset;
 } ENET_PACKED ENetProtocolSendFragment;
 
+/** CONNECT command with the optional migration credential extension,
+  * present when ENET_PROTOCOL_COMMAND_FLAG_MIGRATION is set on the command.
+  */
+typedef struct _ENetProtocolConnectMigration
+{
+   ENetProtocolConnect connect;
+   enet_uint32 migrateCredential [2];
+} ENET_PACKED ENetProtocolConnectMigration;
+
+/** VERIFY_CONNECT command with the optional migration credential extension. */
+typedef struct _ENetProtocolVerifyConnectMigration
+{
+   ENetProtocolVerifyConnect verifyConnect;
+   enet_uint32 migrateCredential [2];
+} ENET_PACKED ENetProtocolVerifyConnectMigration;
+
+/** Sent from a new transport address to request migrating the connection;
+  * carries the credential negotiated during the connect handshake.
+  */
+typedef struct _ENetProtocolMigrate
+{
+   ENetProtocolCommandHeader header;
+   enet_uint32 credential [2];
+} ENET_PACKED ENetProtocolMigrate;
+
+/** Path challenge sent to the candidate new address in response to MIGRATE. */
+typedef struct _ENetProtocolMigrateChallenge
+{
+   ENetProtocolCommandHeader header;
+   enet_uint32 token [2];
+} ENET_PACKED ENetProtocolMigrateChallenge;
+
+/** Response to a path challenge; completes the migration when the
+  * credential, token and source address all match the pending challenge.
+  */
+typedef struct _ENetProtocolMigrateResponse
+{
+   ENetProtocolCommandHeader header;
+   enet_uint32 credential [2];
+   enet_uint32 token [2];
+} ENET_PACKED ENetProtocolMigrateResponse;
+
 typedef union _ENetProtocol
 {
    ENetProtocolCommandHeader header;
@@ -188,6 +236,11 @@ typedef union _ENetProtocol
    ENetProtocolSendFragment sendFragment;
    ENetProtocolBandwidthLimit bandwidthLimit;
    ENetProtocolThrottleConfigure throttleConfigure;
+   ENetProtocolConnectMigration connectMigration;
+   ENetProtocolVerifyConnectMigration verifyConnectMigration;
+   ENetProtocolMigrate migrate;
+   ENetProtocolMigrateChallenge migrateChallenge;
+   ENetProtocolMigrateResponse migrateResponse;
 } ENET_PACKED ENetProtocol;
 
 #ifdef _MSC_VER

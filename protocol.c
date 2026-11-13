@@ -23,13 +23,39 @@ static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
     sizeof (ENetProtocolSendUnsequenced),
     sizeof (ENetProtocolBandwidthLimit),
     sizeof (ENetProtocolThrottleConfigure),
-    sizeof (ENetProtocolSendFragment)
+    sizeof (ENetProtocolSendFragment),
+    sizeof (ENetProtocolMigrate),
+    sizeof (ENetProtocolMigrateChallenge),
+    sizeof (ENetProtocolMigrateResponse)
 };
 
 size_t
 enet_protocol_command_size (enet_uint8 commandNumber)
 {
     return commandSizes [commandNumber & ENET_PROTOCOL_COMMAND_MASK];
+}
+
+/* Size of a command on the wire, taking the optional migration credential
+   extension on CONNECT/VERIFY_CONNECT into account. */
+static size_t
+enet_protocol_command_size_flags (enet_uint8 command)
+{
+    size_t commandSize = commandSizes [command & ENET_PROTOCOL_COMMAND_MASK];
+
+    if ((command & ENET_PROTOCOL_COMMAND_FLAG_MIGRATION) != 0)
+    {
+        switch (command & ENET_PROTOCOL_COMMAND_MASK)
+        {
+        case ENET_PROTOCOL_COMMAND_CONNECT:
+        case ENET_PROTOCOL_COMMAND_VERIFY_CONNECT:
+            commandSize += 2 * sizeof (enet_uint32);
+
+        default:
+            break;
+        }
+    }
+
+    return commandSize;
 }
 
 static void
@@ -289,7 +315,164 @@ enet_protocol_remove_sent_reliable_command (ENetPeer * peer, enet_uint16 reliabl
     peer -> nextTimeout = outgoingCommand -> sentTime + outgoingCommand -> roundTripTimeout;
 
     return commandNumber;
-} 
+}
+
+/* Sends a migration control command directly to an address, bypassing the
+   outgoing command queues.  Uses only stack storage, so no heap allocation
+   takes place on the receive/transmit path of migration packets. */
+static void
+enet_protocol_send_migrate_command (ENetHost * host, ENetPeer * peer, const ENetAddress * address, const ENetProtocol * command, size_t commandSize)
+{
+    enet_uint8 headerData [sizeof (ENetProtocolHeader) + sizeof (enet_uint32)];
+    ENetProtocolHeader * header = (ENetProtocolHeader *) headerData;
+    ENetBuffer buffers [2];
+    enet_uint16 peerID = peer -> outgoingPeerID;
+    int sentLength;
+
+    if (peerID < ENET_PROTOCOL_MAXIMUM_PEER_ID)
+      peerID |= peer -> outgoingSessionID << ENET_PROTOCOL_HEADER_SESSION_SHIFT;
+
+    header -> peerID = ENET_HOST_TO_NET_16 (peerID);
+
+    buffers [0].data = headerData;
+    buffers [0].dataLength = ENET_OFFSETOF (ENetProtocolHeader, sentTime);
+    buffers [1].data = (void *) command;
+    buffers [1].dataLength = commandSize;
+
+    if (host -> checksum != NULL)
+    {
+        enet_uint32 * checksum = (enet_uint32 *) & headerData [buffers [0].dataLength];
+        enet_uint32 newChecksum = peer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID ? peer -> connectID : 0;
+        /* Checksum may be unaligned, use memcpy to avoid undefined behaviour. */
+        memcpy (checksum, & newChecksum, sizeof (enet_uint32));
+        buffers [0].dataLength += sizeof (enet_uint32);
+        newChecksum = host -> checksum (buffers, 2);
+        memcpy (checksum, & newChecksum, sizeof (enet_uint32));
+    }
+
+    sentLength = enet_socket_send (host -> socket, address, buffers, 2);
+
+    if (sentLength > 0)
+    {
+        host -> totalSentData += sentLength;
+        host -> totalSentPackets ++;
+    }
+}
+
+static void
+enet_protocol_generate_migrate_credential (ENetHost * host, enet_uint32 credential [2])
+{
+    credential [0] = enet_host_random (host);
+    credential [1] = enet_host_random (host);
+
+    if (credential [0] == 0 && credential [1] == 0)
+      credential [0] = 1;
+}
+
+/* Handles a MIGRATE request arriving from an unverified address: validates
+   the per-connection credential and answers with a path challenge to the
+   candidate address.  The peer address is left untouched until a valid
+   MIGRATE_RESPONSE completes the challenge. */
+static int
+enet_protocol_handle_migrate (ENetHost * host, ENetPeer * peer, const ENetProtocol * command)
+{
+    ENetProtocol challenge;
+
+    if (! host -> enableMigration ||
+        (peer -> state != ENET_PEER_STATE_CONNECTED && peer -> state != ENET_PEER_STATE_DISCONNECT_LATER))
+      return 0;
+
+    if ((peer -> incomingMigrateCredential [0] == 0 && peer -> incomingMigrateCredential [1] == 0) ||
+        ENET_NET_TO_HOST_32 (command -> migrate.credential [0]) != peer -> incomingMigrateCredential [0] ||
+        ENET_NET_TO_HOST_32 (command -> migrate.credential [1]) != peer -> incomingMigrateCredential [1])
+      return 0;
+
+    /* rate-limit challenges to a given address */
+    if (peer -> migrateChallengeTime != 0 &&
+        peer -> migrateAddress.host == host -> receivedAddress.host &&
+        peer -> migrateAddress.port == host -> receivedAddress.port &&
+        ENET_TIME_DIFFERENCE (host -> serviceTime, peer -> migrateChallengeTime) < ENET_PEER_MIGRATE_CHALLENGE_INTERVAL)
+      return 0;
+
+    peer -> migrateToken [0] = enet_host_random (host);
+    peer -> migrateToken [1] = enet_host_random (host);
+    if (peer -> migrateToken [0] == 0 && peer -> migrateToken [1] == 0)
+      peer -> migrateToken [0] = 1;
+
+    peer -> migrateAddress = host -> receivedAddress;
+    peer -> migrateChallengeTime = ENET_MAX (host -> serviceTime, 1);
+
+    challenge.header.command = ENET_PROTOCOL_COMMAND_MIGRATE_CHALLENGE;
+    challenge.header.channelID = 0xFF;
+    challenge.header.reliableSequenceNumber = 0;
+    challenge.migrateChallenge.token [0] = ENET_HOST_TO_NET_32 (peer -> migrateToken [0]);
+    challenge.migrateChallenge.token [1] = ENET_HOST_TO_NET_32 (peer -> migrateToken [1]);
+
+    enet_protocol_send_migrate_command (host, peer, & peer -> migrateAddress, & challenge, sizeof (ENetProtocolMigrateChallenge));
+
+    return 0;
+}
+
+/* Handles a path challenge from the peer: echo the token back together with
+   our own migration credential.  Only answered while we actually requested a
+   migration, so the credential is never volunteered to unsolicited senders. */
+static int
+enet_protocol_handle_migrate_challenge (ENetHost * host, ENetPeer * peer, const ENetProtocol * command)
+{
+    ENetProtocol response;
+
+    if (! host -> enableMigration ||
+        peer -> migrateState != ENET_PEER_MIGRATE_STATE_REQUESTING ||
+        (peer -> state != ENET_PEER_STATE_CONNECTED && peer -> state != ENET_PEER_STATE_DISCONNECT_LATER))
+      return 0;
+
+    response.header.command = ENET_PROTOCOL_COMMAND_MIGRATE_RESPONSE;
+    response.header.channelID = 0xFF;
+    response.header.reliableSequenceNumber = 0;
+    response.migrateResponse.credential [0] = ENET_HOST_TO_NET_32 (peer -> outgoingMigrateCredential [0]);
+    response.migrateResponse.credential [1] = ENET_HOST_TO_NET_32 (peer -> outgoingMigrateCredential [1]);
+    response.migrateResponse.token [0] = command -> migrateChallenge.token [0];
+    response.migrateResponse.token [1] = command -> migrateChallenge.token [1];
+
+    enet_protocol_send_migrate_command (host, peer, & host -> receivedAddress, & response, sizeof (ENetProtocolMigrateResponse));
+
+    return 0;
+}
+
+/* Handles a path challenge response: only when the credential, token and
+   source address all match the pending challenge is the peer address
+   switched.  Channels, sequence numbers, reliable queues, RTT/loss
+   statistics and unacknowledged data are all preserved across the switch. */
+static int
+enet_protocol_handle_migrate_response (ENetHost * host, ENetPeer * peer, const ENetProtocol * command)
+{
+    if (! host -> enableMigration || peer -> migrateChallengeTime == 0)
+      return 0;
+
+    if (ENET_TIME_DIFFERENCE (host -> serviceTime, peer -> migrateChallengeTime) > ENET_PEER_MIGRATE_CHALLENGE_TIMEOUT)
+    {
+        /* the challenge expired; drop the response and reset the challenge */
+        peer -> migrateChallengeTime = 0;
+
+        return 0;
+    }
+
+    if (ENET_NET_TO_HOST_32 (command -> migrateResponse.credential [0]) != peer -> incomingMigrateCredential [0] ||
+        ENET_NET_TO_HOST_32 (command -> migrateResponse.credential [1]) != peer -> incomingMigrateCredential [1] ||
+        ENET_NET_TO_HOST_32 (command -> migrateResponse.token [0]) != peer -> migrateToken [0] ||
+        ENET_NET_TO_HOST_32 (command -> migrateResponse.token [1]) != peer -> migrateToken [1] ||
+        host -> receivedAddress.host != peer -> migrateAddress.host ||
+        host -> receivedAddress.port != peer -> migrateAddress.port)
+      return 0;
+
+    peer -> address = peer -> migrateAddress;
+    peer -> migrateChallengeTime = 0;
+    peer -> migrateToken [0] = 0;
+    peer -> migrateToken [1] = 0;
+
+    return 0;
+}
+
 
 static ENetPeer *
 enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENetProtocol * command)
@@ -348,6 +531,15 @@ enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENet
     peer -> packetThrottleAcceleration = ENET_NET_TO_HOST_32 (command -> connect.packetThrottleAcceleration);
     peer -> packetThrottleDeceleration = ENET_NET_TO_HOST_32 (command -> connect.packetThrottleDeceleration);
     peer -> eventData = ENET_NET_TO_HOST_32 (command -> connect.data);
+
+    if (host -> enableMigration &&
+        (command -> header.command & ENET_PROTOCOL_COMMAND_FLAG_MIGRATION) != 0)
+    {
+        peer -> outgoingMigrateCredential [0] = ENET_NET_TO_HOST_32 (command -> connectMigration.migrateCredential [0]);
+        peer -> outgoingMigrateCredential [1] = ENET_NET_TO_HOST_32 (command -> connectMigration.migrateCredential [1]);
+
+        enet_protocol_generate_migrate_credential (host, peer -> incomingMigrateCredential);
+    }
 
     incomingSessionID = command -> connect.incomingSessionID == 0xFF ? peer -> outgoingSessionID : command -> connect.incomingSessionID;
     incomingSessionID = (incomingSessionID + 1) & (ENET_PROTOCOL_HEADER_SESSION_MASK >> ENET_PROTOCOL_HEADER_SESSION_SHIFT);
@@ -437,6 +629,13 @@ enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENet
     verifyCommand.verifyConnect.packetThrottleAcceleration = ENET_HOST_TO_NET_32 (peer -> packetThrottleAcceleration);
     verifyCommand.verifyConnect.packetThrottleDeceleration = ENET_HOST_TO_NET_32 (peer -> packetThrottleDeceleration);
     verifyCommand.verifyConnect.connectID = peer -> connectID;
+
+    if (peer -> incomingMigrateCredential [0] != 0 || peer -> incomingMigrateCredential [1] != 0)
+    {
+        verifyCommand.header.command |= ENET_PROTOCOL_COMMAND_FLAG_MIGRATION;
+        verifyCommand.verifyConnectMigration.migrateCredential [0] = ENET_HOST_TO_NET_32 (peer -> incomingMigrateCredential [0]);
+        verifyCommand.verifyConnectMigration.migrateCredential [1] = ENET_HOST_TO_NET_32 (peer -> incomingMigrateCredential [1]);
+    }
 
     enet_peer_queue_outgoing_command (peer, & verifyCommand, NULL, 0, 0);
 
@@ -1005,6 +1204,13 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
     peer -> incomingBandwidth = ENET_NET_TO_HOST_32 (command -> verifyConnect.incomingBandwidth);
     peer -> outgoingBandwidth = ENET_NET_TO_HOST_32 (command -> verifyConnect.outgoingBandwidth);
 
+    if (host -> enableMigration &&
+        (command -> header.command & ENET_PROTOCOL_COMMAND_FLAG_MIGRATION) != 0)
+    {
+        peer -> outgoingMigrateCredential [0] = ENET_NET_TO_HOST_32 (command -> verifyConnectMigration.migrateCredential [0]);
+        peer -> outgoingMigrateCredential [1] = ENET_NET_TO_HOST_32 (command -> verifyConnectMigration.migrateCredential [1]);
+    }
+
     enet_protocol_notify_connect (host, peer, event);
     return 0;
 }
@@ -1019,6 +1225,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     size_t headerSize;
     enet_uint16 peerID, flags;
     enet_uint8 sessionID;
+    int migrationPacket = 0;
 
     if (host -> receivedDataLength < ENET_OFFSETOF(ENetProtocolHeader, sentTime))
       return 0;
@@ -1045,12 +1252,27 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        if (peer -> state == ENET_PEER_STATE_DISCONNECTED ||
            peer -> state == ENET_PEER_STATE_ZOMBIE ||
-           ((host -> receivedAddress.host != peer -> address.host ||
-             host -> receivedAddress.port != peer -> address.port) &&
-             peer -> address.host != ENET_HOST_BROADCAST) ||
            (peer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID &&
             sessionID != peer -> incomingSessionID))
          return 0;
+
+       if ((host -> receivedAddress.host != peer -> address.host ||
+            host -> receivedAddress.port != peer -> address.port) &&
+           peer -> address.host != ENET_HOST_BROADCAST)
+       {
+          /* Packets from an unrecognized address are dropped unless connection
+             migration is enabled and was negotiated for this peer; then only
+             migration commands are accepted from the new address until a path
+             challenge/response exchange confirms the address switch. */
+          if (! host -> enableMigration ||
+              (peer -> state != ENET_PEER_STATE_CONNECTED &&
+               peer -> state != ENET_PEER_STATE_DISCONNECT_LATER) ||
+              (peer -> incomingMigrateCredential [0] == 0 &&
+               peer -> incomingMigrateCredential [1] == 0))
+            return 0;
+
+          migrationPacket = 1;
+       }
     }
  
     if (flags & ENET_PROTOCOL_HEADER_FLAG_COMPRESSED)
@@ -1090,7 +1312,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
           return 0;
     }
        
-    if (peer != NULL)
+    if (peer != NULL && ! migrationPacket)
     {
        peer -> address.host = host -> receivedAddress.host;
        peer -> address.port = host -> receivedAddress.port;
@@ -1110,10 +1332,10 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
          break;
 
        commandNumber = command -> header.command & ENET_PROTOCOL_COMMAND_MASK;
-       if (commandNumber >= ENET_PROTOCOL_COMMAND_COUNT) 
+       if (commandNumber >= ENET_PROTOCOL_COMMAND_COUNT)
          break;
-       
-       commandSize = commandSizes [commandNumber];
+
+       commandSize = enet_protocol_command_size_flags (command -> header.command);
        if (commandSize == 0 || currentData + commandSize > & host -> receivedData [host -> receivedDataLength])
          break;
 
@@ -1121,8 +1343,23 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        if (peer == NULL && commandNumber != ENET_PROTOCOL_COMMAND_CONNECT)
          break;
-         
+
        command -> header.reliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> header.reliableSequenceNumber);
+
+       /* from an unverified address only migration commands are processed;
+          everything else is dropped without touching connection state */
+       if (migrationPacket &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE_CHALLENGE &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE_RESPONSE)
+         break;
+
+       /* regular traffic from the peer means the migration (if any) is over */
+       if (! migrationPacket && peer != NULL &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE_CHALLENGE &&
+           commandNumber != ENET_PROTOCOL_COMMAND_MIGRATE_RESPONSE)
+         peer -> migrateState = ENET_PEER_MIGRATE_STATE_NONE;
 
        switch (commandNumber)
        {
@@ -1189,11 +1426,27 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
             goto commandError;
           break;
 
+       case ENET_PROTOCOL_COMMAND_MIGRATE:
+          if (enet_protocol_handle_migrate (host, peer, command))
+            goto commandError;
+          break;
+
+       case ENET_PROTOCOL_COMMAND_MIGRATE_CHALLENGE:
+          if (enet_protocol_handle_migrate_challenge (host, peer, command))
+            goto commandError;
+          break;
+
+       case ENET_PROTOCOL_COMMAND_MIGRATE_RESPONSE:
+          if (enet_protocol_handle_migrate_response (host, peer, command))
+            goto commandError;
+          break;
+
        default:
           goto commandError;
        }
 
-       if (peer != NULL &&
+       if (! migrationPacket &&
+           peer != NULL &&
            (command -> header.command & ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE) != 0)
        {
            enet_uint16 sentTime;
@@ -1482,7 +1735,7 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
           canPing = 0;
        }
 
-       commandSize = commandSizes [outgoingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_MASK];
+       commandSize = enet_protocol_command_size_flags (outgoingCommand -> command.header.command);
        if (command >= & host -> commands [sizeof (host -> commands) / sizeof (ENetProtocol)] ||
            buffer + 1 >= & host -> buffers [sizeof (host -> buffers) / sizeof (ENetBuffer)] ||
            peer -> mtu - host -> packetSize < commandSize ||
@@ -1646,9 +1899,32 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
             enet_list_empty (& currentPeer -> sentReliableCommands) &&
             ENET_TIME_DIFFERENCE (host -> serviceTime, currentPeer -> lastReceiveTime) >= currentPeer -> pingInterval &&
             currentPeer -> mtu - host -> packetSize >= sizeof (ENetProtocolPing))
-        { 
+        {
             enet_peer_ping (currentPeer);
             enet_protocol_check_outgoing_commands (host, currentPeer, & sentUnreliableCommands);
+        }
+
+        if ((currentPeer -> state == ENET_PEER_STATE_CONNECTED ||
+             currentPeer -> state == ENET_PEER_STATE_DISCONNECT_LATER) &&
+            currentPeer -> migrateState == ENET_PEER_MIGRATE_STATE_REQUESTING &&
+            ENET_TIME_DIFFERENCE (host -> serviceTime, currentPeer -> migrateRequestTime) >= ENET_PEER_MIGRATE_RETRY_INTERVAL)
+        {
+            if (ENET_TIME_DIFFERENCE (host -> serviceTime, currentPeer -> migrateStateTime) >= ENET_PEER_MIGRATE_TIMEOUT)
+              currentPeer -> migrateState = ENET_PEER_MIGRATE_STATE_NONE;
+            else
+            {
+                ENetProtocol command;
+
+                command.header.command = ENET_PROTOCOL_COMMAND_MIGRATE;
+                command.header.channelID = 0xFF;
+                command.header.reliableSequenceNumber = 0;
+                command.migrate.credential [0] = ENET_HOST_TO_NET_32 (currentPeer -> outgoingMigrateCredential [0]);
+                command.migrate.credential [1] = ENET_HOST_TO_NET_32 (currentPeer -> outgoingMigrateCredential [1]);
+
+                currentPeer -> migrateRequestTime = ENET_MAX (host -> serviceTime, 1);
+
+                enet_protocol_send_migrate_command (host, currentPeer, & currentPeer -> address, & command, sizeof (ENetProtocolMigrate));
+            }
         }
 
         if (host -> commandCount == 0)

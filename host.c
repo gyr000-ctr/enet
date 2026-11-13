@@ -103,6 +103,7 @@ enet_host_create (const ENetAddress * address, size_t peerCount, size_t channelL
     host -> duplicatePeers = ENET_PROTOCOL_MAXIMUM_PEER_ID;
     host -> maximumPacketSize = ENET_HOST_DEFAULT_MAXIMUM_PACKET_SIZE;
     host -> maximumWaitingData = ENET_HOST_DEFAULT_MAXIMUM_WAITING_DATA;
+    host -> enableMigration = 0;
 
     host -> compressor.context = NULL;
     host -> compressor.compress = NULL;
@@ -257,7 +258,20 @@ enet_host_connect (ENetHost * host, const ENetAddress * address, size_t channelC
     command.connect.packetThrottleDeceleration = ENET_HOST_TO_NET_32 (currentPeer -> packetThrottleDeceleration);
     command.connect.connectID = currentPeer -> connectID;
     command.connect.data = ENET_HOST_TO_NET_32 (data);
- 
+
+    if (host -> enableMigration)
+    {
+        currentPeer -> incomingMigrateCredential [0] = enet_host_random (host);
+        currentPeer -> incomingMigrateCredential [1] = enet_host_random (host);
+        if (currentPeer -> incomingMigrateCredential [0] == 0 &&
+            currentPeer -> incomingMigrateCredential [1] == 0)
+          currentPeer -> incomingMigrateCredential [0] = 1;
+
+        command.header.command |= ENET_PROTOCOL_COMMAND_FLAG_MIGRATION;
+        command.connectMigration.migrateCredential [0] = ENET_HOST_TO_NET_32 (currentPeer -> incomingMigrateCredential [0]);
+        command.connectMigration.migrateCredential [1] = ENET_HOST_TO_NET_32 (currentPeer -> incomingMigrateCredential [1]);
+    }
+
     enet_peer_queue_outgoing_command (currentPeer, & command, NULL, 0, 0);
 
     return currentPeer;
@@ -301,6 +315,24 @@ enet_host_compress (ENetHost * host, const ENetCompressor * compressor)
       host -> compressor = * compressor;
     else
       host -> compressor.context = NULL;
+}
+
+/** Enables or disables connection migration for a host.
+
+    When enabled, per-connection migration credentials are negotiated during
+    the connect handshake, and a peer whose packets arrive from a new
+    transport address may migrate the connection to that address after
+    proving knowledge of the credential and answering a path challenge.  When
+    disabled (the default), packets from unrecognized addresses are dropped,
+    which is the classic ENet behaviour.
+
+    @param host host to configure
+    @param enabled non-zero to enable connection migration, 0 to disable it
+*/
+void
+enet_host_enable_migration (ENetHost * host, enet_uint32 enabled)
+{
+    host -> enableMigration = enabled != 0;
 }
 
 /** Limits the maximum allowed channels of future incoming connections.

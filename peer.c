@@ -433,6 +433,19 @@ enet_peer_reset (ENetPeer * peer)
     peer -> totalWaitingData = 0;
     peer -> flags = 0;
 
+    peer -> incomingMigrateCredential [0] = 0;
+    peer -> incomingMigrateCredential [1] = 0;
+    peer -> outgoingMigrateCredential [0] = 0;
+    peer -> outgoingMigrateCredential [1] = 0;
+    peer -> migrateAddress.host = ENET_HOST_ANY;
+    peer -> migrateAddress.port = 0;
+    peer -> migrateToken [0] = 0;
+    peer -> migrateToken [1] = 0;
+    peer -> migrateChallengeTime = 0;
+    peer -> migrateRequestTime = 0;
+    peer -> migrateStateTime = 0;
+    peer -> migrateState = ENET_PEER_MIGRATE_STATE_NONE;
+
     memset (peer -> unsequencedWindow, 0, sizeof (peer -> unsequencedWindow));
     
     enet_peer_reset_queues (peer);
@@ -572,6 +585,37 @@ enet_peer_disconnect (ENetPeer * peer, enet_uint32 data)
         enet_host_flush (peer -> host);
         enet_peer_reset (peer);
     }
+}
+
+/** Request migrating the connection to a peer to a new local transport address.
+
+    The local host keeps sending from its socket; if the local address or port
+    has changed (NAT rebinding, network switch), the peer will observe the new
+    source address.  A MIGRATE request carrying the negotiated credential is
+    sent (and retransmitted until the peer answers); the peer answers with a
+    path challenge, and once the challenge round-trip succeeds the peer
+    switches this connection to the new address.  Channels, sequence numbers,
+    reliable queues, RTT/loss statistics and unacknowledged data are preserved.
+
+    @param peer peer to migrate
+    @retval 0 on success
+    @retval < 0 if migration is not enabled on the host, was not negotiated
+            for this peer, or the peer is not connected
+*/
+int
+enet_peer_migrate (ENetPeer * peer)
+{
+    if (! peer -> host -> enableMigration ||
+        (peer -> state != ENET_PEER_STATE_CONNECTED && peer -> state != ENET_PEER_STATE_DISCONNECT_LATER) ||
+        (peer -> outgoingMigrateCredential [0] == 0 && peer -> outgoingMigrateCredential [1] == 0))
+      return -1;
+
+    peer -> migrateState = ENET_PEER_MIGRATE_STATE_REQUESTING;
+    peer -> migrateStateTime = peer -> host -> serviceTime;
+    /* force the first MIGRATE request to go out on the next send pass */
+    peer -> migrateRequestTime = peer -> host -> serviceTime - ENET_PEER_MIGRATE_RETRY_INTERVAL;
+
+    return 0;
 }
 
 int
