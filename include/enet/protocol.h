@@ -35,7 +35,9 @@ typedef enum _ENetProtocolCommand
    ENET_PROTOCOL_COMMAND_BANDWIDTH_LIMIT    = 10,
    ENET_PROTOCOL_COMMAND_THROTTLE_CONFIGURE = 11,
    ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT = 12,
-   ENET_PROTOCOL_COMMAND_COUNT              = 13,
+   ENET_PROTOCOL_COMMAND_MTU_PROBE          = 13,
+   ENET_PROTOCOL_COMMAND_MTU_ACK            = 14,
+   ENET_PROTOCOL_COMMAND_COUNT              = 15,
 
    ENET_PROTOCOL_COMMAND_MASK               = 0x0F
 } ENetProtocolCommand;
@@ -143,6 +145,28 @@ typedef struct _ENetProtocolPing
    ENetProtocolCommandHeader header;
 } ENET_PACKED ENetProtocolPing;
 
+/** Path MTU discovery probe. Carries an authenticated cookie so that off-path
+ *  hosts cannot forge probe acknowledgements and shrink a peer's MTU. The probe
+ *  datagram is padded to exactly probeMtu bytes (including the ENet header). */
+typedef struct _ENetProtocolMtuProbe
+{
+   ENetProtocolCommandHeader header;
+   enet_uint32 cookie;       /**< authenticator keyed by the connection id over probeMtu and nonce */
+   enet_uint32 probeMtu;     /**< total datagram size this probe is verifying, network byte order */
+   enet_uint32 nonce;        /**< random value echoed back in the acknowledgement, network byte order */
+} ENET_PACKED ENetProtocolMtuProbe;
+
+/** Acknowledgement of an authenticated path MTU probe. Sent only after the
+ *  cookie on the incoming probe has been validated, so it can never be used to
+ *  amplify traffic. */
+typedef struct _ENetProtocolMtuAck
+{
+   ENetProtocolCommandHeader header;
+   enet_uint32 cookie;       /**< authenticator recomputed by the receiver, network byte order */
+   enet_uint32 probeMtu;     /**< verified datagram size, network byte order */
+   enet_uint32 nonce;        /**< nonce echoed from the probe, network byte order */
+} ENET_PACKED ENetProtocolMtuAck;
+
 typedef struct _ENetProtocolSendReliable
 {
    ENetProtocolCommandHeader header;
@@ -188,6 +212,8 @@ typedef union _ENetProtocol
    ENetProtocolSendFragment sendFragment;
    ENetProtocolBandwidthLimit bandwidthLimit;
    ENetProtocolThrottleConfigure throttleConfigure;
+   ENetProtocolMtuProbe mtuProbe;
+   ENetProtocolMtuAck mtuAck;
 } ENET_PACKED ENetProtocol;
 
 #ifdef _MSC_VER

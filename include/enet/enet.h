@@ -233,6 +233,17 @@ enum
    ENET_PEER_FREE_RELIABLE_WINDOWS        = 8
 };
 
+enum
+{
+   ENET_MTU_DEFAULT_PROBE_TIMEOUT     = 1000,
+   ENET_MTU_DEFAULT_MAX_PROBE_ATTEMPTS = 3,
+   ENET_MTU_DEFAULT_BLACK_HOLE_BACKOFF = 5000,
+   ENET_MTU_DEFAULT_REVALIDATE_TIME    = 30000,
+   ENET_MTU_ALIGNMENT                  = 8,
+   ENET_MTU_MIN_PROBE_TIMEOUT          = 50,
+   ENET_MTU_MAX_PROBE_TIMEOUT          = 60000
+};
+
 typedef struct _ENetChannel
 {
    enet_uint16  outgoingReliableSequenceNumber;
@@ -250,6 +261,65 @@ typedef enum _ENetPeerFlag
    ENET_PEER_FLAG_NEEDS_DISPATCH   = (1 << 0),
    ENET_PEER_FLAG_CONTINUE_SENDING = (1 << 1)
 } ENetPeerFlag;
+
+/** State of the optional path MTU discovery state machine for a peer. */
+typedef enum _ENetMtuState
+{
+   /** PMTUD is disabled on the host; the peer keeps its fixed configured MTU. */
+   ENET_MTU_STATE_DISABLED          = 0,
+   /** No probe in flight; the current MTU is the last confirmed safe value. */
+   ENET_MTU_STATE_IDLE              = 1,
+   /** A probe datagram has been sent and an acknowledgement is being waited for. */
+   ENET_MTU_STATE_PROBING           = 2,
+   /** Probes were lost (a possible black hole); the MTU was reduced and the
+    *  search will back off before retrying. */
+   ENET_MTU_STATE_BLACK_HOLE        = 3,
+   /** The search converged; the current MTU is periodically revalidated. */
+   ENET_MTU_STATE_CONVERGED         = 4
+} ENetMtuState;
+
+/**
+ * Per-peer path MTU discovery statistics. All counters are cumulative for the
+ * lifetime of the current connection and are reset when the peer is reset.
+ */
+typedef struct _ENetMtuStats
+{
+   enet_uint32 probesSent;          /**< total probe datagrams transmitted (including retries) */
+   enet_uint32 probesAcked;         /**< probes that received a valid authenticated acknowledgement */
+   enet_uint32 probesLost;          /**< probe attempts that timed out without an acknowledgement */
+   enet_uint32 acksSent;            /**< authenticated probe acknowledgements transmitted */
+   enet_uint32 probesRejected;      /**< incoming probes/acks dropped due to cookie or validation failure */
+   enet_uint32 mtuIncreases;        /**< number of times the confirmed MTU was raised */
+   enet_uint32 mtuDecreases;        /**< number of times the confirmed MTU was lowered */
+   enet_uint32 blackHoleEvents;     /**< number of black holes detected (base-MTU probe failures) */
+   enet_uint32 resegmentations;     /**< number of times queued packets were re-segmented for a new MTU */
+   enet_uint32 lastProbeMtu;        /**< MTU value of the most recently sent probe, 0 if none */
+   enet_uint32 currentProbeMtu;     /**< MTU value currently being probed, 0 if idle */
+} ENetMtuStats;
+
+/**
+ * Per-peer path MTU discovery state. Embedded in ENetPeer; the fields are
+ * managed by ENet and should only be read.
+ */
+typedef struct _ENetMtuDiscovery
+{
+   ENetMtuState state;              /**< current state machine state */
+   enet_uint32 baseMtu;             /**< safe lower bound, always confirmed (ENET_PROTOCOL_MINIMUM_MTU) */
+   enet_uint32 maxMtu;              /**< upper bound the search may reach (clamped to the host MTU) */
+   enet_uint32 probeLow;            /**< highest MTU known to work, in bytes */
+   enet_uint32 probeHigh;           /**< lowest MTU known (or being tested) to fail, in bytes */
+   enet_uint32 probeMtu;            /**< MTU currently under test, in bytes */
+   enet_uint32 probeAttempts;       /**< retries spent on the current probeMtu */
+   enet_uint32 probeNonce;          /**< nonce of the probe in flight */
+   enet_uint32 probeCookie;         /**< expected cookie of the probe in flight */
+   enet_uint32 nextProbeTime;       /**< host service time at which the next probe may be sent */
+   enet_uint32 nextRevalidateTime;  /**< host service time at which the converged MTU is revalidated */
+   enet_uint32 blackHoleUntil;      /**< host service time until which probing stays backed off */
+   enet_uint32 floorProbed;         /**< non-zero once the safe floor has been probed in the current search phase */
+   enet_uint32 revalidating;        /**< non-zero while the in-flight probe is a converged-MTU revalidation */
+   enet_uint32 resegmentPending;    /**< flag: queues must be re-segmented before the next send */
+   ENetMtuStats stats;              /**< diagnostic counters */
+} ENetMtuDiscovery;
 
 /**
  * An ENet peer which data packets may be sent or received from. 
@@ -318,6 +388,7 @@ typedef struct _ENetPeer
    enet_uint32   unsequencedWindow [ENET_PEER_UNSEQUENCED_WINDOW_SIZE / 32]; 
    enet_uint32   eventData;
    size_t        totalWaitingData;
+   ENetMtuDiscovery mtuDiscovery;   /**< path MTU discovery state (idle when PMTUD is disabled) */
 } ENetPeer;
 
 /** An ENet packet compressor for compressing UDP packets before socket sends or receives.
@@ -339,7 +410,30 @@ typedef enet_uint32 (ENET_CALLBACK * ENetChecksumCallback) (const ENetBuffer * b
 
 /** Callback for intercepting received raw UDP packets. Should return 1 to intercept, 0 to ignore, or -1 to propagate an error. */
 typedef int (ENET_CALLBACK * ENetInterceptCallback) (struct _ENetHost * host, struct _ENetEvent * event);
- 
+
+/**
+ * Configuration for optional, authenticated path MTU discovery (PMTUD).
+ *
+ * PMTUD is disabled by default and ENet keeps its historical fixed-MTU
+ * behaviour until enet_host_enable_mtu_discovery() is called. When enabled,
+ * each peer starts at ENET_PROTOCOL_MINIMUM_MTU and a binary search driven by
+ * authenticated probe datagrams discovers the largest MTU the path carries.
+ * Probes are sent at most one at a time per peer, are retransmitted a bounded
+ * number of times, and never allocate per probe. On probe failure or a traffic
+ * black hole the peer falls back to the safe minimum MTU, keeps the connection
+ * usable and records diagnostics in ENetMtuStats.
+ */
+typedef struct _ENetMtuConfig
+{
+   int      enabled;             /**< non-zero to enable PMTUD, zero to keep fixed-MTU behaviour */
+   enet_uint32 maxMtu;           /**< upper bound for the search; 0 means the host's configured MTU */
+   enet_uint32 probeTimeout;     /**< acknowledgement wait per probe attempt in ms (clamped to a minimum) */
+   enet_uint32 maxProbeAttempts; /**< retries per candidate before it is declared too large */
+   enet_uint32 blackHoleBackoff; /**< pause after a base-MTU black hole before probing resumes, in ms */
+   enet_uint32 revalidateTime;   /**< period for revalidating a converged MTU, in ms; 0 disables revalidation */
+   int      allowFragmentation;  /**< zero to reject packets larger than the current fragment payload instead of fragmenting */
+} ENetMtuConfig;
+
 /** An ENet host for communicating with peers.
   *
   * No fields should be modified unless otherwise stated.
@@ -394,6 +488,8 @@ typedef struct _ENetHost
    size_t               duplicatePeers;              /**< optional number of allowed peers from duplicate IPs, defaults to ENET_PROTOCOL_MAXIMUM_PEER_ID */
    size_t               maximumPacketSize;           /**< the maximum allowable packet size that may be sent or received on a peer */
    size_t               maximumWaitingData;          /**< the maximum aggregate amount of buffer space a peer may use waiting for packets to be delivered */
+   ENetMtuConfig        mtuConfig;                   /**< path MTU discovery configuration (disabled by default) */
+   enet_uint8           mtuProbeData [ENET_PROTOCOL_MAXIMUM_MTU]; /**< scratch buffer for outgoing MTU probes (no per-probe allocation) */
 } ENetHost;
 
 /**
@@ -578,6 +674,38 @@ extern   void       enet_host_bandwidth_throttle (ENetHost *);
 extern  enet_uint32 enet_host_random_seed (void);
 extern  enet_uint32 enet_host_random (ENetHost *);
 
+/** Enables or reconfigures authenticated path MTU discovery on a host.
+ *
+ * Passing NULL disables PMTUD and restores the fixed-MTU default. Only peers
+ * connecting (or reconnecting) after this call run discovery; already connected
+ * peers keep their current MTU unless enet_peer_start_mtu_discovery() is used.
+ * Zero-valued timing fields in config are replaced with built-in defaults.
+ *
+ * @param host host on which to configure PMTUD
+ * @param config PMTUD parameters, or NULL to disable
+ * @retval 0 on success
+ * @retval < 0 on invalid parameters
+ */
+ENET_API int        enet_host_enable_mtu_discovery (ENetHost * host, const ENetMtuConfig * config);
+
+/** Copies the current path MTU discovery statistics of a peer.
+ * @param peer peer to read
+ * @param stats destination for the counters (must not be NULL)
+ * @retval 0 on success, < 0 on failure
+ */
+ENET_API int        enet_peer_get_mtu_stats (ENetPeer * peer, ENetMtuStats * stats);
+
+/** Starts (or restarts) authenticated path MTU discovery on a connected peer.
+ *
+ * The peer immediately drops back to ENET_PROTOCOL_MINIMUM_MTU and re-searches
+ * towards the configured maximum. No effect if PMTUD is disabled on the host or
+ * the peer has not completed its handshake.
+ *
+ * @param peer peer on which to (re)start discovery
+ * @retval 0 on success, < 0 if PMTUD is disabled or the peer is not connected
+ */
+ENET_API int        enet_peer_start_mtu_discovery (ENetPeer * peer);
+
 ENET_API int                 enet_peer_send (ENetPeer *, enet_uint8, ENetPacket *);
 ENET_API ENetPacket *        enet_peer_receive (ENetPeer *, enet_uint8 * channelID);
 ENET_API void                enet_peer_ping (ENetPeer *);
@@ -599,6 +727,17 @@ extern void                  enet_peer_dispatch_incoming_unreliable_commands (EN
 extern void                  enet_peer_dispatch_incoming_reliable_commands (ENetPeer *, ENetChannel *, ENetIncomingCommand *);
 extern void                  enet_peer_on_connect (ENetPeer *);
 extern void                  enet_peer_on_disconnect (ENetPeer *);
+
+/* Path MTU discovery internals (implemented in mtu.c) */
+extern void                  enet_mtu_initialize_host (ENetHost *);
+extern void                  enet_mtu_initialize_peer (ENetPeer *);
+extern void                  enet_mtu_reset_peer (ENetPeer *);
+extern void                  enet_mtu_on_connect (ENetPeer *);
+extern void                  enet_mtu_pump (ENetHost *, ENetPeer *, enet_uint32);
+extern void                  enet_mtu_before_send (ENetHost *, ENetPeer *);
+extern void                  enet_mtu_handle_probe (ENetHost *, ENetPeer *, const ENetProtocol *);
+extern void                  enet_mtu_handle_ack (ENetHost *, ENetPeer *, const ENetProtocol *);
+extern void                  enet_mtu_note_suspicious_timeout (ENetPeer *);
 
 ENET_API void * enet_range_coder_create (void);
 ENET_API void   enet_range_coder_destroy (void *);

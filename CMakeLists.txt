@@ -85,6 +85,7 @@ set(SOURCE_FILES
     compress.c
     host.c
     list.c
+    mtu.c
     packet.c
     peer.c
     protocol.c
@@ -117,3 +118,11 @@ install(TARGETS enet
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/enet
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+option(ENET_BUILD_TESTS "Build ENet test programs" OFF)
+if(ENET_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_mtu test/test_mtu.c)
+    target_link_libraries(test_mtu enet)
+    add_test(NAME test_mtu COMMAND test_mtu)
+endif()

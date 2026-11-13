@@ -23,7 +23,9 @@ static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
     sizeof (ENetProtocolSendUnsequenced),
     sizeof (ENetProtocolBandwidthLimit),
     sizeof (ENetProtocolThrottleConfigure),
-    sizeof (ENetProtocolSendFragment)
+    sizeof (ENetProtocolSendFragment),
+    sizeof (ENetProtocolMtuProbe),
+    sizeof (ENetProtocolMtuAck)
 };
 
 size_t
@@ -120,6 +122,9 @@ static void
 enet_protocol_notify_connect (ENetHost * host, ENetPeer * peer, ENetEvent * event)
 {
     host -> recalculateBandwidthLimits = 1;
+
+    if (host -> mtuConfig.enabled)
+      enet_mtu_on_connect (peer);
 
     if (event != NULL)
     {
@@ -348,6 +353,12 @@ enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENet
     peer -> packetThrottleAcceleration = ENET_NET_TO_HOST_32 (command -> connect.packetThrottleAcceleration);
     peer -> packetThrottleDeceleration = ENET_NET_TO_HOST_32 (command -> connect.packetThrottleDeceleration);
     peer -> eventData = ENET_NET_TO_HOST_32 (command -> connect.data);
+
+    if (host -> mtuConfig.enabled)
+    {
+        enet_mtu_initialize_peer (peer);
+        enet_mtu_reset_peer (peer);
+    }
 
     incomingSessionID = command -> connect.incomingSessionID == 0xFF ? peer -> outgoingSessionID : command -> connect.incomingSessionID;
     incomingSessionID = (incomingSessionID + 1) & (ENET_PROTOCOL_HEADER_SESSION_MASK >> ENET_PROTOCOL_HEADER_SESSION_SHIFT);
@@ -1189,6 +1200,14 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
             goto commandError;
           break;
 
+       case ENET_PROTOCOL_COMMAND_MTU_PROBE:
+          enet_mtu_handle_probe (host, peer, command);
+          break;
+
+       case ENET_PROTOCOL_COMMAND_MTU_ACK:
+          enet_mtu_handle_ack (host, peer, command);
+          break;
+
        default:
           goto commandError;
        }
@@ -1384,6 +1403,12 @@ enet_protocol_check_timeouts (ENetHost * host, ENetPeer * peer, ENetEvent * even
        }
 
        ++ peer -> packetsLost;
+
+       /* Repeated reliable retransmits while a large MTU is in use can indicate
+        * a path MTU black hole rather than ordinary congestion. PMTUD uses this
+        * signal to step the MTU down conservatively without disconnecting. */
+       if (outgoingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE)
+         enet_mtu_note_suspicious_timeout (peer);
 
        outgoingCommand -> roundTripTimeout *= 2;
 
@@ -1620,6 +1645,14 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
           continue;
 
         currentPeer -> flags &= ~ ENET_PEER_FLAG_CONTINUE_SENDING;
+
+        if (host -> mtuConfig.enabled)
+        {
+           /* Drive the authenticated probe state machine, then re-segment any
+            * queued packets against the newly confirmed MTU before packaging. */
+           enet_mtu_pump (host, currentPeer, host -> serviceTime);
+           enet_mtu_before_send (host, currentPeer);
+        }
 
         host -> headerFlags = 0;
         host -> commandCount = 0;

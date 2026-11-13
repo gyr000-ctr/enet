@@ -121,6 +121,15 @@ enet_peer_send (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet)
    if (peer -> host -> checksum != NULL)
      fragmentLength -= sizeof(enet_uint32);
 
+   if (packet -> dataLength > fragmentLength &&
+       peer -> host -> mtuConfig.enabled &&
+       ! peer -> host -> mtuConfig.allowFragmentation)
+   {
+      /* PMTUD with fragmentation disabled: refuse packets that exceed the
+       * payload of the current confirmed MTU instead of fragmenting. */
+      return -1;
+   }
+
    if (packet -> dataLength > fragmentLength)
    {
       enet_uint32 fragmentCount = (packet -> dataLength + fragmentLength - 1) / fragmentLength,
@@ -434,7 +443,9 @@ enet_peer_reset (ENetPeer * peer)
     peer -> flags = 0;
 
     memset (peer -> unsequencedWindow, 0, sizeof (peer -> unsequencedWindow));
-    
+
+    enet_mtu_reset_peer (peer);
+
     enet_peer_reset_queues (peer);
 }
 

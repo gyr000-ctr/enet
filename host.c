@@ -104,6 +104,8 @@ enet_host_create (const ENetAddress * address, size_t peerCount, size_t channelL
     host -> maximumPacketSize = ENET_HOST_DEFAULT_MAXIMUM_PACKET_SIZE;
     host -> maximumWaitingData = ENET_HOST_DEFAULT_MAXIMUM_WAITING_DATA;
 
+    enet_mtu_initialize_host (host);
+
     host -> compressor.context = NULL;
     host -> compressor.compress = NULL;
     host -> compressor.decompress = NULL;
@@ -213,6 +215,15 @@ enet_host_connect (ENetHost * host, const ENetAddress * address, size_t channelC
     currentPeer -> connectID = enet_host_random (host);
     currentPeer -> mtu = host -> mtu;
 
+    enet_mtu_initialize_peer (currentPeer);
+    if (host -> mtuConfig.enabled)
+    {
+        enet_mtu_reset_peer (currentPeer);
+        /* Begin at the safe floor; the handshake still advertises the host MTU,
+         * but no datagram larger than the confirmed value is ever sent. */
+        currentPeer -> mtu = ENET_PROTOCOL_MINIMUM_MTU;
+    }
+
     if (host -> outgoingBandwidth == 0)
       currentPeer -> windowSize = ENET_PROTOCOL_MAXIMUM_WINDOW_SIZE;
     else
@@ -257,7 +268,7 @@ enet_host_connect (ENetHost * host, const ENetAddress * address, size_t channelC
     command.connect.packetThrottleDeceleration = ENET_HOST_TO_NET_32 (currentPeer -> packetThrottleDeceleration);
     command.connect.connectID = currentPeer -> connectID;
     command.connect.data = ENET_HOST_TO_NET_32 (data);
- 
+
     enet_peer_queue_outgoing_command (currentPeer, & command, NULL, 0, 0);
 
     return currentPeer;
