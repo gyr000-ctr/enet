@@ -17,6 +17,7 @@
 #include "enet/protocol.h"
 #include "enet/list.h"
 #include "enet/callbacks.h"
+#include "enet/crypto.h"
 
 #define ENET_VERSION_MAJOR 1
 #define ENET_VERSION_MINOR 3
@@ -315,9 +316,10 @@ typedef struct _ENetPeer
    enet_uint16   reserved;
    enet_uint16   incomingUnsequencedGroup;
    enet_uint16   outgoingUnsequencedGroup;
-   enet_uint32   unsequencedWindow [ENET_PEER_UNSEQUENCED_WINDOW_SIZE / 32]; 
+   enet_uint32   unsequencedWindow [ENET_PEER_UNSEQUENCED_WINDOW_SIZE / 32];
    enet_uint32   eventData;
    size_t        totalWaitingData;
+   ENetCryptoPeer crypto;          /**< optional packet-crypto session state, see enet/crypto.h */
 } ENetPeer;
 
 /** An ENet packet compressor for compressing UDP packets before socket sends or receives.
@@ -394,6 +396,9 @@ typedef struct _ENetHost
    size_t               duplicatePeers;              /**< optional number of allowed peers from duplicate IPs, defaults to ENET_PROTOCOL_MAXIMUM_PEER_ID */
    size_t               maximumPacketSize;           /**< the maximum allowable packet size that may be sent or received on a peer */
    size_t               maximumWaitingData;          /**< the maximum aggregate amount of buffer space a peer may use waiting for packets to be delivered */
+   int                  cryptoEnabled;               /**< non-zero when optional packet crypto is enabled (and required) for this host */
+   enet_uint8           cryptoPsk [ENET_CRYPTO_KEY_SIZE]; /**< pre-shared key, securely zeroed by enet_host_crypto_clear/enet_host_destroy */
+   ENetCryptoStats      cryptoStats;                 /**< packet crypto counters, valid while cryptoEnabled */
 } ENetHost;
 
 /**

@@ -157,6 +157,9 @@ enet_host_destroy (ENetHost * host)
     if (host -> compressor.context != NULL && host -> compressor.destroy)
       (* host -> compressor.destroy) (host -> compressor.context);
 
+    /* scrub key material before releasing the memory */
+    enet_crypto_memzero (host -> cryptoPsk, sizeof (host -> cryptoPsk));
+
     enet_free (host -> peers);
     enet_free (host);
 }
@@ -259,6 +262,26 @@ enet_host_connect (ENetHost * host, const ENetAddress * address, size_t channelC
     command.connect.data = ENET_HOST_TO_NET_32 (data);
  
     enet_peer_queue_outgoing_command (currentPeer, & command, NULL, 0, 0);
+
+    /* when packet crypto is enabled, piggyback the key-negotiation
+       handshake on the (reliable) connect exchange */
+    if (host -> cryptoEnabled)
+    {
+        ENetProtocol handshakeCommand;
+
+        memset (& handshakeCommand, 0, sizeof (handshakeCommand));
+        handshakeCommand.header.command = ENET_PROTOCOL_COMMAND_CRYPTO_HANDSHAKE | ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE;
+        handshakeCommand.header.channelID = 0xFF;
+        handshakeCommand.cryptoHandshake.subtype = ENET_CRYPTO_HANDSHAKE_INIT;
+        handshakeCommand.cryptoHandshake.version = ENET_CRYPTO_HANDSHAKE_VERSION;
+        handshakeCommand.cryptoHandshake.reserved = 0;
+
+        enet_crypto_hs_init (host, currentPeer,
+                             handshakeCommand.cryptoHandshake.clientNonce,
+                             handshakeCommand.cryptoHandshake.mac);
+
+        enet_peer_queue_outgoing_command (currentPeer, & handshakeCommand, NULL, 0, 0);
+    }
 
     return currentPeer;
 }

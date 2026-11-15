@@ -35,7 +35,8 @@ typedef enum _ENetProtocolCommand
    ENET_PROTOCOL_COMMAND_BANDWIDTH_LIMIT    = 10,
    ENET_PROTOCOL_COMMAND_THROTTLE_CONFIGURE = 11,
    ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT = 12,
-   ENET_PROTOCOL_COMMAND_COUNT              = 13,
+   ENET_PROTOCOL_COMMAND_CRYPTO_HANDSHAKE = 13,
+   ENET_PROTOCOL_COMMAND_COUNT              = 14,
 
    ENET_PROTOCOL_COMMAND_MASK               = 0x0F
 } ENetProtocolCommand;
@@ -174,6 +175,17 @@ typedef struct _ENetProtocolSendFragment
    enet_uint32 fragmentOffset;
 } ENET_PACKED ENetProtocolSendFragment;
 
+typedef struct _ENetProtocolCryptoHandshake
+{
+   ENetProtocolCommandHeader header;
+   enet_uint8  subtype;        /* ENetCryptoHandshakeType: 1 = INIT, 2 = REPLY */
+   enet_uint8  version;        /* ENET_CRYPTO_HANDSHAKE_VERSION */
+   enet_uint16 reserved;
+   enet_uint8  clientNonce [32];
+   enet_uint8  serverNonce [32];
+   enet_uint8  mac [16];
+} ENET_PACKED ENetProtocolCryptoHandshake;
+
 typedef union _ENetProtocol
 {
    ENetProtocolCommandHeader header;
@@ -188,6 +200,7 @@ typedef union _ENetProtocol
    ENetProtocolSendFragment sendFragment;
    ENetProtocolBandwidthLimit bandwidthLimit;
    ENetProtocolThrottleConfigure throttleConfigure;
+   ENetProtocolCryptoHandshake cryptoHandshake;
 } ENET_PACKED ENetProtocol;
 
 #ifdef _MSC_VER

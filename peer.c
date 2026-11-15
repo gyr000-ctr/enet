@@ -434,7 +434,10 @@ enet_peer_reset (ENetPeer * peer)
     peer -> flags = 0;
 
     memset (peer -> unsequencedWindow, 0, sizeof (peer -> unsequencedWindow));
-    
+
+    /* securely erase any crypto session state (keys, nonces, replay windows) */
+    enet_crypto_peer_reset (peer);
+
     enet_peer_reset_queues (peer);
 }
 

@@ -70,6 +70,7 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 set(INCLUDE_FILES_PREFIX include/enet)
 set(INCLUDE_FILES
     ${INCLUDE_FILES_PREFIX}/callbacks.h
+    ${INCLUDE_FILES_PREFIX}/crypto.h
     ${INCLUDE_FILES_PREFIX}/enet.h
     ${INCLUDE_FILES_PREFIX}/list.h
     ${INCLUDE_FILES_PREFIX}/protocol.h
@@ -83,6 +84,7 @@ set(INCLUDE_FILES
 set(SOURCE_FILES
     callbacks.c
     compress.c
+    crypto.c
     host.c
     list.c
     packet.c
@@ -105,7 +107,22 @@ add_library(enet
 )
 
 if (WIN32)
-    target_link_libraries(enet winmm ws2_32)
+    target_link_libraries(enet winmm ws2_32 advapi32)
+endif()
+
+option(ENET_BUILD_TESTS "Build the ENet test suite" ON)
+if(ENET_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_crypto_vectors tests/test_crypto_vectors.c)
+    target_link_libraries(test_crypto_vectors enet)
+    add_executable(test_crypto_integration tests/test_crypto_integration.c)
+    target_link_libraries(test_crypto_integration enet)
+    if(WIN32)
+        target_link_libraries(test_crypto_vectors winmm ws2_32 advapi32)
+        target_link_libraries(test_crypto_integration winmm ws2_32 advapi32)
+    endif()
+    add_test(NAME crypto_vectors COMMAND test_crypto_vectors)
+    add_test(NAME crypto_integration COMMAND test_crypto_integration)
 endif()
 
 include(GNUInstallDirs)

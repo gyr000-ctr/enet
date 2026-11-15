@@ -23,7 +23,8 @@ static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
     sizeof (ENetProtocolSendUnsequenced),
     sizeof (ENetProtocolBandwidthLimit),
     sizeof (ENetProtocolThrottleConfigure),
-    sizeof (ENetProtocolSendFragment)
+    sizeof (ENetProtocolSendFragment),
+    sizeof (ENetProtocolCryptoHandshake)
 };
 
 size_t
@@ -915,6 +916,15 @@ enet_protocol_handle_acknowledge (ENetHost * host, ENetEvent * event, ENetPeer *
     peer -> lastReceiveTime = ENET_MAX (host -> serviceTime, 1);
     peer -> earliestTimeout = 0;
 
+    /* when packet crypto is enabled, the connect handshake may only
+       complete once crypto is established; ignore acknowledgements of the
+       VERIFY_CONNECT until then so it keeps being retransmitted (a peer
+       that cannot negotiate crypto must never complete the connection) */
+    if (host -> cryptoEnabled &&
+        peer -> state == ENET_PEER_STATE_ACKNOWLEDGING_CONNECT &&
+        ! (peer -> crypto.flags & ENET_CRYPTO_PEER_RECV_READY))
+      return 0;
+
     receivedReliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> acknowledge.receivedReliableSequenceNumber);
 
     commandNumber = enet_protocol_remove_sent_reliable_command (peer, receivedReliableSequenceNumber, command -> header.channelID);
@@ -924,6 +934,11 @@ enet_protocol_handle_acknowledge (ENetHost * host, ENetEvent * event, ENetPeer *
     case ENET_PEER_STATE_ACKNOWLEDGING_CONNECT:
        if (commandNumber != ENET_PROTOCOL_COMMAND_VERIFY_CONNECT)
          return -1;
+
+       /* when packet crypto is enabled the connection may only complete
+          after the crypto handshake has finished */
+       if (host -> cryptoEnabled && ! (peer -> crypto.flags & ENET_CRYPTO_PEER_RECV_READY))
+         break;
 
        enet_protocol_notify_connect (host, peer, event);
        break;
@@ -989,7 +1004,15 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
       mtu = ENET_PROTOCOL_MAXIMUM_MTU;
 
     if (mtu < peer -> mtu)
-      peer -> mtu = mtu;
+    {
+        peer -> mtu = mtu;
+
+        /* if the crypto handshake already activated encryption, keep the
+           crypto overhead reservation on the (re-)negotiated mtu */
+        if ((peer -> crypto.flags & ENET_CRYPTO_PEER_SEND_ACTIVE) &&
+            peer -> mtu > ENET_CRYPTO_OVERHEAD)
+          peer -> mtu -= ENET_CRYPTO_OVERHEAD;
+    }
 
     windowSize = ENET_NET_TO_HOST_32 (command -> verifyConnect.windowSize);
 
@@ -1005,8 +1028,94 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
     peer -> incomingBandwidth = ENET_NET_TO_HOST_32 (command -> verifyConnect.incomingBandwidth);
     peer -> outgoingBandwidth = ENET_NET_TO_HOST_32 (command -> verifyConnect.outgoingBandwidth);
 
+    /* with crypto enabled, the connection completes only once the crypto
+       handshake has also finished (see the CRYPTO_HANDSHAKE handler) */
+    if (host -> cryptoEnabled && ! (peer -> crypto.flags & ENET_CRYPTO_PEER_RECV_READY))
+    {
+        peer -> crypto.flags |= ENET_CRYPTO_PEER_VERIFY_RECEIVED;
+        return 0;
+    }
+
     enet_protocol_notify_connect (host, peer, event);
     return 0;
+}
+
+static int
+enet_protocol_handle_crypto_handshake (ENetHost * host, ENetEvent * event, ENetPeer * peer, const ENetProtocol * command)
+{
+    const ENetProtocolCryptoHandshake * handshake = & command -> cryptoHandshake;
+
+    if (! host -> cryptoEnabled || peer == NULL ||
+        handshake -> version != ENET_CRYPTO_HANDSHAKE_VERSION)
+    {
+        if (host -> cryptoEnabled)
+          ++ host -> cryptoStats.handshakeFailures;
+        return -1;
+    }
+
+    switch (handshake -> subtype)
+    {
+    case ENET_CRYPTO_HANDSHAKE_INIT:
+    {
+        ENetProtocol reply;
+        int result;
+
+        memset (& reply, 0, sizeof (reply));
+        reply.header.command = ENET_PROTOCOL_COMMAND_CRYPTO_HANDSHAKE | ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE;
+        reply.header.channelID = 0xFF;
+        reply.cryptoHandshake.subtype = ENET_CRYPTO_HANDSHAKE_REPLY;
+        reply.cryptoHandshake.version = ENET_CRYPTO_HANDSHAKE_VERSION;
+        reply.cryptoHandshake.reserved = 0;
+
+        result = enet_crypto_hs_accept (host, peer,
+                                        handshake -> clientNonce, handshake -> mac,
+                                        reply.cryptoHandshake.serverNonce, reply.cryptoHandshake.mac);
+        if (result < 0)
+        {
+            ++ host -> cryptoStats.handshakeFailures;
+            return -1;
+        }
+
+        memcpy (reply.cryptoHandshake.clientNonce, peer -> crypto.clientNonce, sizeof (reply.cryptoHandshake.clientNonce));
+
+        if (result == 0)
+          ++ host -> cryptoStats.handshakesCompleted;
+
+        enet_peer_queue_outgoing_command (peer, & reply, NULL, 0, 0);
+        return 0;
+    }
+
+    case ENET_CRYPTO_HANDSHAKE_REPLY:
+    {
+        int result = enet_crypto_hs_complete (host, peer, handshake -> serverNonce, handshake -> mac);
+
+        if (result < 0)
+        {
+            ++ host -> cryptoStats.handshakeFailures;
+            return -1;
+        }
+
+        if (result == 0)
+        {
+            ++ host -> cryptoStats.handshakesCompleted;
+
+            /* the client proves its keys with its next (encrypted) packet;
+               it may encrypt right away */
+            enet_crypto_peer_activate_send (peer);
+
+            /* if VERIFY_CONNECT already arrived, the connection may now
+               complete */
+            if ((peer -> crypto.flags & ENET_CRYPTO_PEER_VERIFY_RECEIVED) &&
+                peer -> state == ENET_PEER_STATE_CONNECTING)
+              enet_protocol_notify_connect (host, peer, event);
+        }
+        return 0;
+    }
+
+    default:
+        ++ host -> cryptoStats.handshakeFailures;
+        return -1;
+    }
 }
 
 static int
@@ -1019,6 +1128,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     size_t headerSize;
     enet_uint16 peerID, flags;
     enet_uint8 sessionID;
+    int wasEncrypted = 0;
 
     if (host -> receivedDataLength < ENET_OFFSETOF(ENetProtocolHeader, sentTime))
       return 0;
@@ -1031,8 +1141,6 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     peerID &= ~ (ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
 
     headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : ENET_OFFSETOF(ENetProtocolHeader, sentTime));
-    if (host -> checksum != NULL)
-      headerSize += sizeof (enet_uint32);
 
     if (peerID == ENET_PROTOCOL_MAXIMUM_PEER_ID)
       peer = NULL;
@@ -1052,7 +1160,31 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
             sessionID != peer -> incomingSessionID))
          return 0;
     }
- 
+
+    /* Once the crypto handshake has completed for a peer, every packet from
+       that peer is encrypted: verify and decrypt it in place before any
+       further processing.  Any failure drops the packet (and is counted in
+       host -> cryptoStats) without disturbing the connection. */
+    if (host -> cryptoEnabled && peer != NULL &&
+        (peer -> crypto.flags & ENET_CRYPTO_PEER_RECV_READY))
+    {
+        int plaintextLength = enet_crypto_open_packet (host, peer,
+                                                       host -> receivedData, headerSize,
+                                                       host -> receivedDataLength - headerSize);
+        if (plaintextLength < 0)
+          return 0;
+
+        host -> receivedDataLength = headerSize + (size_t) plaintextLength;
+        wasEncrypted = 1;
+
+        /* the peer proved it holds the keys; start encrypting towards it */
+        enet_crypto_peer_activate_send (peer);
+    }
+
+    /* encrypted packets carry no checksum field; the AEAD tag is stronger */
+    if (! wasEncrypted && host -> checksum != NULL)
+      headerSize += sizeof (enet_uint32);
+
     if (flags & ENET_PROTOCOL_HEADER_FLAG_COMPRESSED)
     {
         size_t originalSize;
@@ -1072,7 +1204,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
         host -> receivedDataLength = headerSize + originalSize;
     }
 
-    if (host -> checksum != NULL)
+    if (host -> checksum != NULL && ! wasEncrypted)
     {
         enet_uint32 * checksum = (enet_uint32 *) & host -> receivedData [headerSize - sizeof (enet_uint32)];
         enet_uint32 desiredChecksum, newChecksum;
@@ -1123,6 +1255,26 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
          break;
          
        command -> header.reliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> header.reliableSequenceNumber);
+
+       /* when packet crypto is enabled, plaintext packets may only carry
+          connection-setup commands; anything else means a missing/broken
+          crypto negotiation and is dropped (and counted) */
+       if (host -> cryptoEnabled && ! wasEncrypted)
+       {
+           switch (commandNumber)
+           {
+           case ENET_PROTOCOL_COMMAND_CONNECT:
+           case ENET_PROTOCOL_COMMAND_VERIFY_CONNECT:
+           case ENET_PROTOCOL_COMMAND_CRYPTO_HANDSHAKE:
+           case ENET_PROTOCOL_COMMAND_ACKNOWLEDGE:
+           case ENET_PROTOCOL_COMMAND_DISCONNECT:
+              break;
+
+           default:
+              ++ host -> cryptoStats.droppedPlaintext;
+              goto commandError;
+           }
+       }
 
        switch (commandNumber)
        {
@@ -1186,6 +1338,11 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        case ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT:
           if (enet_protocol_handle_send_unreliable_fragment (host, peer, command, & currentData))
+            goto commandError;
+          break;
+
+       case ENET_PROTOCOL_COMMAND_CRYPTO_HANDSHAKE:
+          if (enet_protocol_handle_crypto_handshake (host, event, peer, command))
             goto commandError;
           break;
 
@@ -1605,6 +1762,7 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
     ENetProtocolHeader * header = (ENetProtocolHeader *) headerData;
     int sentLength = 0;
     size_t shouldCompress = 0;
+    int cryptoSend = 0;
     ENetList sentUnreliableCommands;
 
     enet_list_clear (& sentUnreliableCommands);
@@ -1620,6 +1778,9 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
           continue;
 
         currentPeer -> flags &= ~ ENET_PEER_FLAG_CONTINUE_SENDING;
+
+        cryptoSend = host -> cryptoEnabled &&
+                     (currentPeer -> crypto.flags & ENET_CRYPTO_PEER_SEND_ACTIVE) != 0;
 
         host -> headerFlags = 0;
         host -> commandCount = 0;
@@ -1687,11 +1848,13 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         shouldCompress = 0;
         if (host -> compressor.context != NULL && host -> compressor.compress != NULL)
         {
+            /* when the packet will be encrypted, compress into packetData [0]
+               so the encryption scratch space stays consistent */
             size_t originalSize = host -> packetSize - sizeof(ENetProtocolHeader),
                    compressedSize = host -> compressor.compress (host -> compressor.context,
                                         & host -> buffers [1], host -> bufferCount - 1,
                                         originalSize,
-                                        host -> packetData [1],
+                                        host -> packetData [cryptoSend ? 0 : 1],
                                         originalSize);
             if (compressedSize > 0 && compressedSize < originalSize)
             {
@@ -1706,7 +1869,7 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         if (currentPeer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID)
           host -> headerFlags |= currentPeer -> outgoingSessionID << ENET_PROTOCOL_HEADER_SESSION_SHIFT;
         header -> peerID = ENET_HOST_TO_NET_16 (currentPeer -> outgoingPeerID | host -> headerFlags);
-        if (host -> checksum != NULL)
+        if (host -> checksum != NULL && ! cryptoSend)
         {
             enet_uint32 * checksum = (enet_uint32 *) & headerData [host -> buffers -> dataLength];
             enet_uint32 newChecksum = currentPeer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID ? currentPeer -> connectID : 0;
@@ -1719,8 +1882,45 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 
         if (shouldCompress > 0)
         {
-            host -> buffers [1].data = host -> packetData [1];
+            host -> buffers [1].data = host -> packetData [cryptoSend ? 0 : 1];
             host -> buffers [1].dataLength = shouldCompress;
+            host -> bufferCount = 2;
+        }
+
+        if (cryptoSend)
+        {
+            /* Gather the command region, then seal it: the plaintext ENet
+               header stays as-is (it is the AEAD's additional data) and the
+               crypto header || ciphertext || tag go into packetData [1]. */
+            enet_uint8 * gathered = host -> packetData [0];
+            size_t plaintextLength = 0, bufferIndex;
+            int sealedLength;
+
+            if (shouldCompress > 0)
+              plaintextLength = shouldCompress;
+            else
+            {
+                for (bufferIndex = 1; bufferIndex < host -> bufferCount; ++ bufferIndex)
+                {
+                    memcpy (gathered + plaintextLength, host -> buffers [bufferIndex].data, host -> buffers [bufferIndex].dataLength);
+                    plaintextLength += host -> buffers [bufferIndex].dataLength;
+                }
+            }
+
+            sealedLength = enet_crypto_seal_packet (host, currentPeer,
+                                                    host -> buffers [0].data, host -> buffers [0].dataLength,
+                                                    gathered, plaintextLength,
+                                                    host -> packetData [1], sizeof (host -> packetData [1]));
+            if (sealedLength < 0)
+            {
+                /* could not seal: drop this packet (reliable commands will
+                   be retransmitted) */
+                enet_protocol_remove_sent_unreliable_commands (currentPeer, & sentUnreliableCommands);
+                goto nextPeer;
+            }
+
+            host -> buffers [1].data = host -> packetData [1];
+            host -> buffers [1].dataLength = (size_t) sealedLength;
             host -> bufferCount = 2;
         }
 
